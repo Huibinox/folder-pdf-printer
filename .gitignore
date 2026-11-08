@@ -1,0 +1,6 @@
+tools/
+dist/
+build/
+*.user
+*.log
+test-output/
