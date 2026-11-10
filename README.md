@@ -1,11 +1,9 @@
-# Folder PDF Printer
+# Folder PDF Printer v4.0.2
 
-Windows 单文件 Python 工具。添加多个目录后自动递归查找 PDF，可确认清单后批量发出打印请求。需要公司已批准的 Python（带 Tkinter）、Adobe Acrobat Reader DC 和可用的 Windows 默认打印机。
+单文件 Python 工具，适合从多个文件夹批量打印 PDF。基于 v4.0.1 的 Windows 打印关联，需要公司已批准的 Python（带 Tkinter）、默认 PDF 应用 Acrobat Reader DC，以及 Windows 默认实体打印机。
 
-1. 下载 Release 里的 pdf_batch_print.py，在脚本所在目录运行 py pdf_batch_print.py。
-2. 在资源管理器打开目标目录，按 Ctrl+L、Ctrl+C 复制路径，粘贴到工具里并点击「添加路径」。支持映射盘和 UNC 路径。浏览器链接需通过公司批准的同步或映射功能在资源管理器中打开。
-3. 添加、移除目录或改变子目录选项时会自动扫描。相同路径只列一次。文件变化后可点「重新扫描」。
-4. 列表默认全选，按 Ctrl 或 Shift 可调整选择。「检查选中文件」检查能否读取文件及识别 PDF 文件头。
-5. 将 Adobe Acrobat Reader 设为 Windows 默认 PDF 应用，确认默认实体打印机，点击「打印选中文件」并确认。
+1. 下载 pdf_batch_print.py，在脚本目录运行 py pdf_batch_print.py。
+2. 添加本机或网盘目录，工具会自动扫描子目录中的 PDF。可按 Ctrl 或 Shift 选择要打印的文件。
+3. 点一次「打印选中文件」。当前文件在 Windows 队列出现且完成缓冲后，才发送下一份。
 
-打印使用 Windows 为 PDF 注册的 Adobe 打印操作。列表记录请求是否发出，实际进度在 Windows 打印队列查看。停止仅影响后续请求。扫描不会发起打印，也不会持续监控目录。
+每份最多等待 120 秒。队列权限受限、驱动使用其他任务名、任务过快离开队列或网络延迟都可能导致无法确认。工具会停在该文件。先看队列和出纸情况，再决定补打哪些文件。「已入队」表示观察到打印任务，实际出纸由打印机完成。

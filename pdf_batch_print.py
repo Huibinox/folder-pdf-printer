@@ -2,11 +2,13 @@
 """Scan PDFs and invoke the Acrobat Reader Windows Print action."""
 import ctypes
 from ctypes import wintypes
+import getpass
 import ntpath
 import os
 import queue
 import re
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -74,6 +76,94 @@ def default_printer():
     return name.value
 
 
+class PrintUnconfirmed(Exception):
+    """The request was made, but its queue entry could not be verified."""
+
+
+class JobInfo(ctypes.Structure):
+    _fields_ = (
+        [("id", wintypes.DWORD)]
+        + [(field, wintypes.LPWSTR) for field in
+           ("printer", "machine", "user", "document", "datatype", "status_text")]
+        + [(field, wintypes.DWORD) for field in
+           ("status", "priority", "position", "total_pages", "pages_printed")]
+        + [("submitted", wintypes.WORD * 8)]
+    )
+
+
+def queue_jobs(printer):
+    spool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+    open_printer = spool.OpenPrinterW
+    open_printer.argtypes = (wintypes.LPWSTR, ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p)
+    open_printer.restype = wintypes.BOOL
+    close_printer = spool.ClosePrinter
+    close_printer.argtypes = (wintypes.HANDLE,)
+    close_printer.restype = wintypes.BOOL
+    enum_jobs = spool.EnumJobsW
+    enum_jobs.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+    )
+    enum_jobs.restype = wintypes.BOOL
+    handle = wintypes.HANDLE()
+    if not open_printer(printer, ctypes.byref(handle), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        needed = wintypes.DWORD()
+        count = wintypes.DWORD()
+        size = 8192
+        for _ in range(4):
+            buffer = ctypes.create_string_buffer(size)
+            if enum_jobs(handle, 0, 0xFFFFFFFF, 1, buffer, size, ctypes.byref(needed), ctypes.byref(count)):
+                jobs = (JobInfo * count.value).from_buffer(buffer)
+                return {job.id: (job.user or "", job.document or "", job.status) for job in jobs}
+            error = ctypes.get_last_error()
+            if error != 122:
+                raise ctypes.WinError(error)
+            size = max(size * 2, needed.value)
+        raise OSError("打印队列在读取期间发生变化，请稍后重试。")
+    finally:
+        close_printer(handle)
+
+
+
+
+
+def submit_and_confirm(path, printer, stop, on_sent, timeout=120):
+    baseline = queue_jobs(printer)
+    if stop.is_set():
+        return None
+    if default_printer() != printer:
+        raise OSError("默认打印机发生变化，请重新确认。")
+    os.startfile(path, "print")
+    on_sent()
+    deadline = time.monotonic() + timeout
+    filename = ntpath.basename(path).casefold()
+    titles = {filename, ntpath.splitext(filename)[0]}
+    current_user = getpass.getuser().casefold()
+    confirmed = None
+    while not stop.is_set() and time.monotonic() < deadline:
+        try:
+            jobs = queue_jobs(printer)
+        except OSError as exc:
+            raise PrintUnconfirmed(f"无法读取打印队列。{exc}") from exc
+        if confirmed is None:
+            for job_id, (user, document, _) in jobs.items():
+                owner = user.replace("/", "\\").rsplit("\\", 1)[-1].split("@", 1)[0].casefold()
+                title = ntpath.basename(document.strip().strip('"')).casefold()
+                if job_id not in baseline and owner == current_user and title in titles:
+                    confirmed = job_id
+                    break
+        if confirmed is not None:
+            # JOB_STATUS_SPOOLING; a fast job can also leave the queue after being observed.
+            if confirmed not in jobs or not jobs[confirmed][2] & 0x0008:
+                return confirmed
+        stop.wait(0.2)
+    reason = "已停止等待" if stop.is_set() else "等待入队或缓冲超时"
+    raise PrintUnconfirmed(f"{reason}。请检查打印队列和出纸结果后，再决定是否重试。")
+
+
 class App:
     def __init__(self, window):
         self.window = window
@@ -82,7 +172,7 @@ class App:
         self.paths = {}
         self.busy = False
         self.controls = []
-        window.title("PDF 批量打印 · Python 版")
+        window.title("PDF 批量打印 · v4.0.2 逐份确认")
         window.geometry("880x580")
         window.minsize(640, 440)
         outer = ttk.Frame(window, padding=14)
@@ -213,7 +303,7 @@ class App:
                 return
 
         def process():
-            ok = failed = 0
+            ok = failed = uncertain = 0
             for item, path in batch:
                 if self.stop_requested.is_set():
                     break
@@ -222,20 +312,31 @@ class App:
                         if b"%PDF-" not in document.read(1024):
                             raise OSError("未找到 PDF 文件头")
                     if not dry:
-                        if default_printer() != printer:
-                            raise OSError("默认打印机发生变化，请重新确认。")
-                        if self.stop_requested.is_set():
+
+                        def waiting():
+                            self.events.put(("row", (item, "已请求，等待入队和缓冲")))
+
+                        job = submit_and_confirm(path, printer, self.stop_requested, waiting)
+                        if job is None:
                             break
-                        os.startfile(path, "print")
                     ok += 1
-                    self.events.put(("row", (item, "可读取" if dry else "已发出请求")))
+                    status = "可读取" if dry else f"已入队 #{job}"
+                    self.events.put(("row", (item, status)))
+                except PrintUnconfirmed as exc:
+                    uncertain += 1
+                    self.events.put(("row", (item, "未确认，已暂停")))
+                    self.events.put(("error", f"{path}\n\n{exc}"))
+                    break
+
                 except OSError as exc:
                     failed += 1
                     self.events.put(("row", (item, f"失败 · {exc}")))
                     if not dry:
                         self.events.put(("error", f"{path}\n\n{exc}"))
                         break
-            self.events.put(("summary", f"成功 {ok}，失败 {failed}，未处理 {len(batch) - ok - failed}。"))
+            outcome = "检查通过" if dry else "确认入队"
+            remaining = len(batch) - ok - failed - uncertain
+            self.events.put(("summary", f"{outcome} {ok}，失败 {failed}，未确认 {uncertain}，未处理 {remaining}。"))
 
         self.status.set("正在检查…" if dry else "正在发出打印请求…")
         self.work(process, cancellable=True)
