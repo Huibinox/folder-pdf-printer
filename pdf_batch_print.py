@@ -164,6 +164,119 @@ def submit_and_confirm(path, printer, stop, on_sent, timeout=120):
     raise PrintUnconfirmed(f"{reason}。请检查打印队列和出纸结果后，再决定是否重试。")
 
 
+
+def close_printed_pdf(path, stop, app_window):
+    """Close one visible Acrobat document, or return a reason to pause."""
+    user32 = ctypes.WinDLL("user32.dll")
+    kernel32 = ctypes.WinDLL("kernel32.dll")
+
+    def api(library, name, result, *args):
+        function = getattr(library, name)
+        function.argtypes, function.restype = args, result
+        return function
+
+    hwnd = wintypes.HWND
+    get_title = api(user32, "GetWindowTextW", ctypes.c_int, hwnd, wintypes.LPWSTR, ctypes.c_int)
+    get_class = api(user32, "GetClassNameW", ctypes.c_int, hwnd, wintypes.LPWSTR, ctypes.c_int)
+    get_pid = api(user32, "GetWindowThreadProcessId", wintypes.DWORD, hwnd, ctypes.POINTER(wintypes.DWORD))
+    foreground = api(user32, "GetForegroundWindow", hwnd)
+    activate = api(user32, "SetForegroundWindow", wintypes.BOOL, hwnd)
+    root_window = api(user32, "GetAncestor", hwnd, hwnd, wintypes.UINT)(app_window, 2)
+    enabled = api(user32, "IsWindowEnabled", wintypes.BOOL, hwnd)
+    visible = api(user32, "IsWindowVisible", wintypes.BOOL, hwnd)
+    popup = api(user32, "GetLastActivePopup", hwnd, hwnd)
+    open_process = api(kernel32, "OpenProcess", wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    image = api(kernel32, "QueryFullProcessImageNameW", wintypes.BOOL, wintypes.HANDLE, wintypes.DWORD,
+                wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    close_handle = api(kernel32, "CloseHandle", wintypes.BOOL, wintypes.HANDLE)
+    enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, hwnd, wintypes.LPARAM)
+    enum_windows = api(user32, "EnumWindows", wintypes.BOOL, enum_type, wintypes.LPARAM)
+    expected = ntpath.basename(path).casefold()
+
+    def matching_window(window):
+        text = ctypes.create_unicode_buffer(1024)
+        get_class(window, text, len(text))
+        if text.value != "AcrobatSDIWindow":
+            return False
+        get_title(window, text, len(text))
+        name = re.sub(r"\s+[-–—]\s+(?:Adobe )?Acrobat(?:\b.*)?$", "", text.value, flags=re.I)
+        if name.casefold() != expected:
+            return False
+        pid = wintypes.DWORD()
+        get_pid(window, ctypes.byref(pid))
+        process = open_process(0x1000, False, pid)
+        if not process:
+            return False
+        try:
+            size = wintypes.DWORD(len(text))
+            return (image(process, 0, text, ctypes.byref(size))
+                    and ntpath.basename(text.value).casefold() in {"acrobat.exe", "acrord32.exe"})
+        finally:
+            close_handle(process)
+
+    deadline = time.monotonic() + 5
+    target = None
+    while not stop.is_set() and time.monotonic() < deadline:
+        matches = []
+        def collect(window, _):
+            if visible(window) and matching_window(window):
+                matches.append(window)
+            return True
+        enum_windows(enum_type(collect), 0)
+        if len(matches) > 1:
+            return "有多个同名 Acrobat 窗口，无法确定要关闭哪一个。"
+        if matches:
+            target = matches[0]
+            break
+        stop.wait(0.15)
+    if not target or stop.is_set():
+        return "找不到标题与当前 PDF 文件名一致的 Acrobat 窗口。"
+    if not enabled(target) or popup(target) not in (None, target):
+        return "Acrobat 有弹窗或窗口被禁用。"
+    if foreground() == root_window:
+        activate(target)
+    if foreground() != target or not matching_window(target) or stop.is_set():
+        return "Acrobat 没有处于前台，或当前文档已变化。"
+
+    class KeyboardInput(ctypes.Structure):
+        _fields_ = [("vk", wintypes.WORD), ("scan", wintypes.WORD), ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("extra", ctypes.c_size_t)]
+
+    class MouseInput(ctypes.Structure):
+        _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG), ("data", wintypes.DWORD),
+                    ("flags", wintypes.DWORD), ("time", wintypes.DWORD), ("extra", ctypes.c_size_t)]
+
+    class InputData(ctypes.Union):
+        _fields_ = [("keyboard", KeyboardInput), ("mouse", MouseInput)]
+
+    class Input(ctypes.Structure):
+        _fields_ = [("kind", wintypes.DWORD), ("data", InputData)]
+
+    send = api(user32, "SendInput", wintypes.UINT, wintypes.UINT, ctypes.POINTER(Input), ctypes.c_int)
+    key_state = api(user32, "GetAsyncKeyState", ctypes.c_short, ctypes.c_int)
+    if any(key_state(key) & 0x8000 for key in (0x10, 0x11, 0x12, 0x5B, 0x5C)):
+        return "检测到组合键按下，已暂停。"
+    # Ctrl+F4 is Adobe's documented close-current-document shortcut.
+    keys = (Input * 4)()
+    for item, (key, flags) in zip(keys, ((0x11, 0), (0x73, 0), (0x73, 2), (0x11, 2))):
+        item.kind = 1
+        item.data.keyboard = KeyboardInput(key, 0, flags, 0, 0)
+    if foreground() != target or not matching_window(target) or stop.is_set():
+        return "发送关闭快捷键前，活动文档已变化。"
+    if send(len(keys), keys, ctypes.sizeof(Input)) != len(keys):
+        return "Windows 未接受关闭快捷键。"
+
+    deadline = time.monotonic() + 5
+    while not stop.is_set() and time.monotonic() < deadline:
+        if visible(target) and (not enabled(target) or popup(target) not in (None, target)):
+            return "Acrobat 弹出了提示，请手动处理。"
+        if not visible(target) or not matching_window(target):
+            return None
+        stop.wait(0.15)
+    return "未确认 Acrobat 已关闭当前文档。"
+
+
+
 class App:
     def __init__(self, window):
         self.window = window
@@ -172,7 +285,7 @@ class App:
         self.paths = {}
         self.busy = False
         self.controls = []
-        window.title("PDF 批量打印 · v4.0.3 逐份确认")
+        window.title("PDF 批量打印 · v4.0.4 逐份确认")
         window.geometry("880x580")
         window.minsize(640, 440)
         outer = ttk.Frame(window, padding=14)
@@ -217,6 +330,10 @@ class App:
         pause_toggle = ttk.Checkbutton(row, text="每份关掉 Acrobat 文档后继续", variable=self.pause_after_print)
         pause_toggle.pack(side="left", padx=4)
         self.controls.append(pause_toggle)
+        self.auto_close_after_print = tk.BooleanVar(value=False)
+        auto_close = ttk.Checkbutton(outer, text="自动关闭已入队的 Acrobat PDF（试用）", variable=self.auto_close_after_print)
+        auto_close.pack(anchor="w", pady=(0, 5))
+        self.controls.append(auto_close)
         self.status = tk.StringVar(value="粘贴网盘目录的完整路径，添加后自动扫描。")
         ttk.Label(outer, textvariable=self.status, wraplength=610).pack(anchor="w")
         window.protocol("WM_DELETE_WINDOW", self.close)
@@ -295,6 +412,7 @@ class App:
         if not batch:
             messagebox.showinfo("选择文件", "请在列表中选中要处理的文档。", parent=self.window)
             return
+        auto_close = not dry and self.auto_close_after_print.get()
         printer = None
         if not dry:
             try:
@@ -303,10 +421,14 @@ class App:
             except OSError as exc:
                 messagebox.showerror("打印设置", str(exc), parent=self.window)
                 return
-            if not messagebox.askokcancel("确认打印", f"向 {printer} 发出 {len(batch)} 个打印请求？", parent=self.window):
+            message = f"向 {printer} 发出 {len(batch)} 个打印请求？"
+            if auto_close:
+                message += "\n\n自动关闭模式需要先关掉 Acrobat 中其他 PDF，并保持 Windows 桌面解锁。"
+            if not messagebox.askokcancel("确认打印", message, parent=self.window):
                 return
 
         pause_between = not dry and self.pause_after_print.get()
+        app_window = self.window.winfo_id()
 
         def process():
             ok = failed = uncertain = 0
@@ -328,9 +450,16 @@ class App:
                     ok += 1
                     status = "可读取" if dry else f"已入队 #{job}"
                     self.events.put(("row", (item, status)))
-                    if pause_between and index + 1 < len(batch):
+                    close_error = None
+                    if auto_close:
+                        close_error = close_printed_pdf(path, self.stop_requested, app_window)
+                        if close_error is None:
+                            self.events.put(("row", (item, f"已入队 #{job} · 已关闭")))
+                    if close_error and index + 1 == len(batch):
+                        self.events.put(("row", (item, f"已入队 #{job} · 请手动关闭")))
+                    if (close_error or pause_between and not auto_close) and index + 1 < len(batch):
                         resume = threading.Event()
-                        self.events.put(("pause_for_close", (ntpath.basename(path), resume)))
+                        self.events.put(("pause_for_close", (ntpath.basename(path), resume, close_error)))
                         while not self.stop_requested.is_set() and not resume.wait(0.1):
                             pass
                 except PrintUnconfirmed as exc:
@@ -373,13 +502,14 @@ class App:
                 self.files.set(item, "status", status)
                 self.status.set(status)
             elif event == "pause_for_close":
-                filename, resume = data
+                filename, resume, reason = data
                 try:
                     if not self.stop_requested.is_set():
                         self.status.set(f"{filename} 已入队，等待关闭 Acrobat 标签页。")
                         proceed = messagebox.askokcancel(
                             "关闭当前 PDF 后继续",
-                            f"{filename} 已入队。\n\n请切换到 Acrobat，关闭这份 PDF 的标签页。"
+                            f"{filename} 已入队。\n" + (f"{reason}\n" if reason else "")
+                            + "\n请切换到 Acrobat，关闭这份 PDF 的标签页。"
                             "回来点「确定」再打印下一份。点「取消」结束本批后续任务。",
                             parent=self.window,
                         )
