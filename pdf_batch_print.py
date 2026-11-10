@@ -115,6 +115,36 @@ def queue_jobs(printer):
 
 
 
+
+def acrobat_services():
+    # Resolve the actual PDF ProgID before trying Adobe's standard service names.
+    classes = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.pdf\UserChoice") as key:
+            prog_id = winreg.QueryValueEx(key, "ProgId")[0]
+            if isinstance(prog_id, str) and prog_id.casefold().startswith("acroexch."):
+                classes.append(prog_id)
+    except OSError:
+        pass
+    classes.extend(("acrobat", "AcroExch.Document.DC", "AcroExch.Document"))
+    services = ["acroview"]
+    for prog_id in dict.fromkeys(classes):
+        for verb in ("open", "print", "printto"):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    key_path = rf"{prog_id}\shell\{verb}\ddeexec\application"
+                    with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key_path, 0, winreg.KEY_READ | view) as key:
+                        service = winreg.QueryValueEx(key, "")[0]
+                except OSError:
+                    continue
+                if isinstance(service, str) and re.fullmatch(r"AcroView[AR]?\d*", service, re.I):
+                    services.append(service.casefold())
+    services.extend(("acroviewr20", "acroviewa20"))
+    return tuple(dict.fromkeys(services))
+
+
+
 def send_acrobat_command(command):
     """Send one Adobe IAC command to the running Reader on this thread."""
     user32 = ctypes.WinDLL("user32.dll")
@@ -150,25 +180,14 @@ def send_acrobat_command(command):
     try:
         topic = create_string(instance, "control", 1200)
         strings.append(topic)
-        # Some DC builds register a versioned service for the Explorer association.
-        services = ["acroview"]
-        for key in (r"acrobat\shell\open\ddeexec\application",
-                    r"AcroExch.Document.DC\shell\open\ddeexec\application"):
-            try:
-                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key) as registry:
-                    service = winreg.QueryValueEx(registry, "")[0]
-            except OSError:
-                continue
-            if isinstance(service, str) and re.fullmatch(r"AcroView[AR]?\d*", service, re.I):
-                services.append(service)
-        for service in dict.fromkeys(services):
+        for service in acrobat_services():
             name = create_string(instance, service, 1200)
             strings.append(name)
             conversation = connect(instance, name, topic, None)
             if conversation:
                 break
         if not conversation:
-            raise OSError("未能连接 Acrobat Reader。请先打开 Reader，再重试。")
+            raise OSError("未能连接已运行的 Acrobat Reader 接口。可用「复制 PDF 路径」，在 Reader 按 Ctrl+O 打开。")
         payload = ctypes.create_unicode_buffer(command)
         if not transact(payload, ctypes.sizeof(payload), conversation, None, 0, 0x4050, 15000, None):
             error = last_error(instance)
@@ -264,6 +283,7 @@ class App:
         row = ttk.Frame(outer)
         row.pack(fill="x", pady=6)
         self.button(row, "检查选中文件", lambda: self.run_batch(dry=True))
+        self.button(row, "复制 PDF 路径", self.copy_pdf_path)
         self.button(row, "在 Acrobat 打开", lambda: self.run_batch(dry=False, open_only=True))
         self.button(row, "打印选中文件", lambda: self.run_batch(dry=False))
         self.stop_button = ttk.Button(row, text="停止后续任务", command=self.stop_requested.set, state="disabled")
@@ -339,6 +359,17 @@ class App:
         self.status.set("正在读取目录…")
         recursive = self.recursive.get()
         self.work(lambda: self.events.put(("scanned", scan_folders(folders, recursive))))
+
+
+    def copy_pdf_path(self):
+        selected = self.files.selection()
+        if len(selected) != 1:
+            messagebox.showinfo("复制 PDF 路径", "请在清单中单击一份 PDF。", parent=self.window)
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(self.paths[selected[0]])
+        self.status.set("已复制完整路径。在 Reader 按 Ctrl+O，再粘贴到文件名框。")
+
 
     def run_batch(self, dry, open_only=False):
         selected = set(self.files.selection())
