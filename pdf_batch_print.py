@@ -2,11 +2,14 @@
 """Scan PDFs and invoke the Acrobat Reader Windows Print action."""
 import ctypes
 from ctypes import wintypes
+import getpass
 import ntpath
 import os
 import queue
 import re
 import threading
+import time
+import winreg
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -43,21 +46,6 @@ def scan_folders(folders, recursive):
     return sorted(files.values(), key=sort_key), errors
 
 
-def require_acrobat_print_handler():
-    # Query the executable Windows registered for the PDF print verb.
-    query = ctypes.WinDLL("shlwapi.dll").AssocQueryStringW
-    query.argtypes = (
-        wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
-        wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
-    )
-    query.restype = ctypes.c_long
-    size = wintypes.DWORD(32768)
-    path = ctypes.create_unicode_buffer(size.value)
-    result = query(0, 2, ".pdf", "print", path, ctypes.byref(size))
-    if result != 0 or ntpath.basename(path.value).casefold() not in {"acrord32.exe", "acrobat.exe"}:
-        raise OSError("Windows 当前没有将 PDF 的打印操作交给 Adobe Acrobat Reader。请将 Acrobat Reader 设为默认 PDF 应用后重试。")
-
-
 def default_printer():
     get_name = ctypes.WinDLL("winspool.drv", use_last_error=True).GetDefaultPrinterW
     get_name.argtypes = (wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
@@ -72,6 +60,162 @@ def default_printer():
     if any(label in name.value.casefold() for label in ("print to pdf", "adobe pdf", "xps", "onenote", "fax")):
         raise OSError(f"当前默认打印机为 {name.value}，请先选择实际打印机。")
     return name.value
+
+
+
+class PrintUnconfirmed(Exception):
+    """The request was made, but its queue entry could not be verified."""
+
+
+class JobInfo(ctypes.Structure):
+    _fields_ = (
+        [("id", wintypes.DWORD)]
+        + [(field, wintypes.LPWSTR) for field in
+           ("printer", "machine", "user", "document", "datatype", "status_text")]
+        + [(field, wintypes.DWORD) for field in
+           ("status", "priority", "position", "total_pages", "pages_printed")]
+        + [("submitted", wintypes.WORD * 8)]
+    )
+
+
+def queue_jobs(printer):
+    spool = ctypes.WinDLL("winspool.drv", use_last_error=True)
+    open_printer = spool.OpenPrinterW
+    open_printer.argtypes = (wintypes.LPWSTR, ctypes.POINTER(wintypes.HANDLE), ctypes.c_void_p)
+    open_printer.restype = wintypes.BOOL
+    close_printer = spool.ClosePrinter
+    close_printer.argtypes = (wintypes.HANDLE,)
+    close_printer.restype = wintypes.BOOL
+    enum_jobs = spool.EnumJobsW
+    enum_jobs.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+    )
+    enum_jobs.restype = wintypes.BOOL
+    handle = wintypes.HANDLE()
+    if not open_printer(printer, ctypes.byref(handle), None):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        needed = wintypes.DWORD()
+        count = wintypes.DWORD()
+        size = 8192
+        for _ in range(4):
+            buffer = ctypes.create_string_buffer(size)
+            if enum_jobs(handle, 0, 0xFFFFFFFF, 1, buffer, size, ctypes.byref(needed), ctypes.byref(count)):
+                jobs = (JobInfo * count.value).from_buffer(buffer)
+                return {job.id: (job.user or "", job.document or "") for job in jobs}
+            error = ctypes.get_last_error()
+            if error != 122:
+                raise ctypes.WinError(error)
+            size = max(size * 2, needed.value)
+        raise OSError("打印队列在读取期间发生变化，请稍后重试。")
+    finally:
+        close_printer(handle)
+
+
+
+def send_acrobat_command(command):
+    """Send one Adobe IAC command to the running Reader on this thread."""
+    user32 = ctypes.WinDLL("user32.dll")
+    handle = wintypes.HANDLE
+    dword_pointer = ctypes.POINTER(wintypes.DWORD)
+    callback_type = ctypes.WINFUNCTYPE(
+        handle, wintypes.UINT, wintypes.UINT,
+        handle, handle, handle, handle, ctypes.c_size_t, ctypes.c_size_t,
+    )
+    callback = callback_type(lambda *args: None)
+
+    def api(name, result, *args):
+        function = getattr(user32, name)
+        function.restype = result
+        function.argtypes = args
+        return function
+
+    initialize = api("DdeInitializeW", wintypes.UINT, dword_pointer, callback_type, wintypes.DWORD, wintypes.DWORD)
+    uninitialize = api("DdeUninitialize", wintypes.BOOL, wintypes.DWORD)
+    create_string = api("DdeCreateStringHandleW", handle, wintypes.DWORD, wintypes.LPCWSTR, ctypes.c_int)
+    free_string = api("DdeFreeStringHandle", wintypes.BOOL, wintypes.DWORD, handle)
+    connect = api("DdeConnect", handle, wintypes.DWORD, handle, handle, ctypes.c_void_p)
+    disconnect = api("DdeDisconnect", wintypes.BOOL, handle)
+    transact = api("DdeClientTransaction", handle, ctypes.c_void_p, wintypes.DWORD,
+                   handle, handle, wintypes.UINT, wintypes.UINT, wintypes.DWORD, dword_pointer)
+    last_error = api("DdeGetLastError", wintypes.UINT, wintypes.DWORD)
+    instance = wintypes.DWORD()
+    result = initialize(ctypes.byref(instance), callback, 0x10, 0)  # APPCMD_CLIENTONLY
+    if result:
+        raise OSError(f"无法初始化 Adobe 连接（0x{result:04X}）。")
+    strings = []
+    conversation = None
+    try:
+        topic = create_string(instance, "control", 1200)
+        strings.append(topic)
+        # Some DC builds register a versioned service for the Explorer association.
+        services = ["acroview"]
+        for key in (r"acrobat\shell\open\ddeexec\application",
+                    r"AcroExch.Document.DC\shell\open\ddeexec\application"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, key) as registry:
+                    service = winreg.QueryValueEx(registry, "")[0]
+            except OSError:
+                continue
+            if isinstance(service, str) and re.fullmatch(r"AcroView[AR]?\d*", service, re.I):
+                services.append(service)
+        for service in dict.fromkeys(services):
+            name = create_string(instance, service, 1200)
+            strings.append(name)
+            conversation = connect(instance, name, topic, None)
+            if conversation:
+                break
+        if not conversation:
+            raise OSError("未能连接 Acrobat Reader。请先打开 Reader，再重试。")
+        payload = ctypes.create_unicode_buffer(command)
+        if not transact(payload, ctypes.sizeof(payload), conversation, None, 0, 0x4050, 15000, None):
+            error = last_error(instance)
+            raise PrintUnconfirmed(f"Adobe 未确认命令（0x{error:04X}）。请检查 Reader 和打印队列。")
+    finally:
+        if conversation:
+            disconnect(conversation)
+        for value in strings:
+            if value:
+                free_string(instance, value)
+        uninitialize(instance)
+
+
+def acrobat_file_command(verb, path):
+    if verb not in {"FileOpen", "FilePrintSilent"}:
+        raise ValueError("Unknown Acrobat command")
+    if '"' in path or any(ord(character) < 32 for character in path):
+        raise ValueError("路径含有 Adobe 命令无法处理的字符。")
+    return f'[{verb}("{path}")]'
+
+
+
+def submit_and_confirm(path, printer, stop, on_sent, timeout=30):
+    baseline = queue_jobs(printer)
+    if stop.is_set():
+        return None
+    if default_printer() != printer:
+        raise OSError("默认打印机发生变化，请重新确认。")
+    send_acrobat_command(acrobat_file_command("FilePrintSilent", path))
+    on_sent()
+    deadline = time.monotonic() + timeout
+    filename = ntpath.basename(path).casefold()
+    titles = {filename, ntpath.splitext(filename)[0]}
+    current_user = getpass.getuser().casefold()
+    while not stop.is_set() and time.monotonic() < deadline:
+        try:
+            jobs = queue_jobs(printer)
+        except OSError as exc:
+            raise PrintUnconfirmed(f"无法读取打印队列。{exc}") from exc
+        for job_id, (user, document) in jobs.items():
+            owner = user.replace("/", "\\").rsplit("\\", 1)[-1].casefold()
+            title = ntpath.basename(document.strip().strip('"')).casefold()
+            if job_id not in baseline and owner == current_user and title in titles:
+                return job_id
+        stop.wait(0.2)
+    raise PrintUnconfirmed("未确认入队，请检查打印队列后再决定是否重试。")
+
 
 
 class App:
@@ -120,6 +264,7 @@ class App:
         row = ttk.Frame(outer)
         row.pack(fill="x", pady=6)
         self.button(row, "检查选中文件", lambda: self.run_batch(dry=True))
+        self.button(row, "在 Acrobat 打开", lambda: self.run_batch(dry=False, open_only=True))
         self.button(row, "打印选中文件", lambda: self.run_batch(dry=False))
         self.stop_button = ttk.Button(row, text="停止后续任务", command=self.stop_requested.set, state="disabled")
         self.stop_button.pack(side="left", padx=4)
@@ -195,25 +340,24 @@ class App:
         recursive = self.recursive.get()
         self.work(lambda: self.events.put(("scanned", scan_folders(folders, recursive))))
 
-    def run_batch(self, dry):
+    def run_batch(self, dry, open_only=False):
         selected = set(self.files.selection())
         batch = [(item, path) for item, path in self.paths.items() if item in selected]
         if not batch:
             messagebox.showinfo("选择文件", "请在列表中选中要处理的文档。", parent=self.window)
             return
         printer = None
-        if not dry:
+        if not dry and not open_only:
             try:
-                require_acrobat_print_handler()
                 printer = default_printer()
             except OSError as exc:
                 messagebox.showerror("打印设置", str(exc), parent=self.window)
                 return
-            if not messagebox.askokcancel("确认打印", f"向 {printer} 发出 {len(batch)} 个打印请求？", parent=self.window):
+            if not messagebox.askokcancel("确认打印", f"请确认 Acrobat 使用 Windows 默认打印机 {printer}。\n\n逐份提交 {len(batch)} 份 PDF？", parent=self.window):
                 return
 
         def process():
-            ok = failed = 0
+            ok = failed = uncertain = 0
             for item, path in batch:
                 if self.stop_requested.is_set():
                     break
@@ -221,23 +365,33 @@ class App:
                     with open(path, "rb") as document:
                         if b"%PDF-" not in document.read(1024):
                             raise OSError("未找到 PDF 文件头")
-                    if not dry:
-                        if default_printer() != printer:
-                            raise OSError("默认打印机发生变化，请重新确认。")
-                        if self.stop_requested.is_set():
+                    if open_only:
+                        send_acrobat_command(acrobat_file_command("FileOpen", path))
+                    elif not dry:
+                        def waiting():
+                            self.events.put(("row", (item, "已请求，等待入队")))
+
+                        job = submit_and_confirm(path, printer, self.stop_requested, waiting)
+                        if job is None:
                             break
-                        os.startfile(path, "print")
                     ok += 1
-                    self.events.put(("row", (item, "可读取" if dry else "已发出请求")))
+                    status = "已打开" if open_only else ("可读取" if dry else f"已入队 #{job}")
+                    self.events.put(("row", (item, status)))
+                except PrintUnconfirmed as exc:
+                    uncertain += 1
+                    self.events.put(("row", (item, "打开未确认" if open_only else "入队未确认")))
+                    self.events.put(("error", f"{path}\n\n{exc}"))
+                    break
                 except OSError as exc:
                     failed += 1
                     self.events.put(("row", (item, f"失败 · {exc}")))
                     if not dry:
                         self.events.put(("error", f"{path}\n\n{exc}"))
                         break
-            self.events.put(("summary", f"成功 {ok}，失败 {failed}，未处理 {len(batch) - ok - failed}。"))
+            outcome = "已打开" if open_only else ("检查通过" if dry else "确认入队")
+            self.events.put(("summary", f"{outcome} {ok}，失败 {failed}，未确认 {uncertain}，未处理 {len(batch) - ok - failed - uncertain}。"))
 
-        self.status.set("正在检查…" if dry else "正在发出打印请求…")
+        self.status.set("正在打开…" if open_only else ("正在检查…" if dry else "正在向 Acrobat 提交打印…"))
         self.work(process, cancellable=True)
 
     def process_events(self):
