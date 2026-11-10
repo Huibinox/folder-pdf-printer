@@ -172,7 +172,7 @@ class App:
         self.paths = {}
         self.busy = False
         self.controls = []
-        window.title("PDF 批量打印 · v4.0.2 逐份确认")
+        window.title("PDF 批量打印 · v4.0.3 逐份确认")
         window.geometry("880x580")
         window.minsize(640, 440)
         outer = ttk.Frame(window, padding=14)
@@ -213,6 +213,10 @@ class App:
         self.button(row, "打印选中文件", lambda: self.run_batch(dry=False))
         self.stop_button = ttk.Button(row, text="停止后续任务", command=self.stop_requested.set, state="disabled")
         self.stop_button.pack(side="left", padx=4)
+        self.pause_after_print = tk.BooleanVar(value=False)
+        pause_toggle = ttk.Checkbutton(row, text="每份关掉 Acrobat 文档后继续", variable=self.pause_after_print)
+        pause_toggle.pack(side="left", padx=4)
+        self.controls.append(pause_toggle)
         self.status = tk.StringVar(value="粘贴网盘目录的完整路径，添加后自动扫描。")
         ttk.Label(outer, textvariable=self.status, wraplength=610).pack(anchor="w")
         window.protocol("WM_DELETE_WINDOW", self.close)
@@ -302,9 +306,11 @@ class App:
             if not messagebox.askokcancel("确认打印", f"向 {printer} 发出 {len(batch)} 个打印请求？", parent=self.window):
                 return
 
+        pause_between = not dry and self.pause_after_print.get()
+
         def process():
             ok = failed = uncertain = 0
-            for item, path in batch:
+            for index, (item, path) in enumerate(batch):
                 if self.stop_requested.is_set():
                     break
                 try:
@@ -322,6 +328,11 @@ class App:
                     ok += 1
                     status = "可读取" if dry else f"已入队 #{job}"
                     self.events.put(("row", (item, status)))
+                    if pause_between and index + 1 < len(batch):
+                        resume = threading.Event()
+                        self.events.put(("pause_for_close", (ntpath.basename(path), resume)))
+                        while not self.stop_requested.is_set() and not resume.wait(0.1):
+                            pass
                 except PrintUnconfirmed as exc:
                     uncertain += 1
                     self.events.put(("row", (item, "未确认，已暂停")))
@@ -361,6 +372,21 @@ class App:
                 item, status = data
                 self.files.set(item, "status", status)
                 self.status.set(status)
+            elif event == "pause_for_close":
+                filename, resume = data
+                try:
+                    if not self.stop_requested.is_set():
+                        self.status.set(f"{filename} 已入队，等待关闭 Acrobat 标签页。")
+                        proceed = messagebox.askokcancel(
+                            "关闭当前 PDF 后继续",
+                            f"{filename} 已入队。\n\n请切换到 Acrobat，关闭这份 PDF 的标签页。"
+                            "回来点「确定」再打印下一份。点「取消」结束本批后续任务。",
+                            parent=self.window,
+                        )
+                        if not proceed:
+                            self.stop_requested.set()
+                finally:
+                    resume.set()
             elif event == "summary":
                 self.status.set(data)
             elif event == "error":
