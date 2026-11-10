@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""Scan Word documents and invoke the Windows Print action."""
+"""Scan PDFs and invoke the Acrobat Reader Windows Print action."""
 import ctypes
 from ctypes import wintypes
 import ntpath
@@ -34,13 +34,28 @@ def scan_folders(folders, recursive):
                     if not getattr(os.path, "isjunction", os.path.islink)(os.path.join(root, d))
                 ]
             for name in names:
-                if not name.startswith("~$") and ntpath.splitext(name)[1].lower() in {".doc", ".docx"}:
+                if ntpath.splitext(name)[1].lower() == ".pdf":
                     path = os.path.join(root, name)
                     files.setdefault(ntpath.normcase(path), path)
     def sort_key(path):
         return [int(part) if part.isascii() and part.isdigit() else part.casefold()
                 for part in re.split(r"([0-9]+)", path)]
     return sorted(files.values(), key=sort_key), errors
+
+
+def require_acrobat_print_handler():
+    # Query the executable Windows registered for the PDF print verb.
+    query = ctypes.WinDLL("shlwapi.dll").AssocQueryStringW
+    query.argtypes = (
+        wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
+        wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    )
+    query.restype = ctypes.c_long
+    size = wintypes.DWORD(32768)
+    path = ctypes.create_unicode_buffer(size.value)
+    result = query(0, 2, ".pdf", "print", path, ctypes.byref(size))
+    if result != 0 or ntpath.basename(path.value).casefold() not in {"acrord32.exe", "acrobat.exe"}:
+        raise OSError("Windows 当前没有将 PDF 的打印操作交给 Adobe Acrobat Reader。请将 Acrobat Reader 设为默认 PDF 应用后重试。")
 
 
 def default_printer():
@@ -67,7 +82,7 @@ class App:
         self.paths = {}
         self.busy = False
         self.controls = []
-        window.title("Word 批量打印 · Python 版")
+        window.title("PDF 批量打印 · Python 版")
         window.geometry("880x580")
         window.minsize(640, 440)
         outer = ttk.Frame(window, padding=14)
@@ -86,14 +101,14 @@ class App:
         row = ttk.Frame(outer)
         row.pack(fill="x", pady=6)
         self.recursive = tk.BooleanVar(value=True)
-        toggle = ttk.Checkbutton(row, text="包含子文件夹", variable=self.recursive, command=self.clear_files)
+        toggle = ttk.Checkbutton(row, text="包含子文件夹", variable=self.recursive, command=self.refresh)
         toggle.pack(side="left")
         self.controls.extend([self.entry, toggle])
-        self.button(row, "扫描 Word", self.scan)
+        self.button(row, "重新扫描", self.scan)
         self.button(row, "全选", lambda: self.files.selection_set(self.files.get_children()))
         self.button(row, "清除选中", lambda: self.files.selection_remove(self.files.selection()))
         self.files = ttk.Treeview(outer, columns=("file", "folder", "status"), show="headings")
-        for column, title, width in (("file", "Word 文档", 210), ("folder", "所在目录", 400), ("status", "状态", 155)):
+        for column, title, width in (("file", "PDF 文件", 210), ("folder", "所在目录", 400), ("status", "状态", 155)):
             self.files.heading(column, text=title)
             self.files.column(column, width=width, minwidth=80)
         body = ttk.Frame(outer)
@@ -108,7 +123,7 @@ class App:
         self.button(row, "打印选中文件", lambda: self.run_batch(dry=False))
         self.stop_button = ttk.Button(row, text="停止后续任务", command=self.stop_requested.set, state="disabled")
         self.stop_button.pack(side="left", padx=4)
-        self.status = tk.StringVar(value="粘贴网盘目录的完整路径，添加后点击扫描。")
+        self.status = tk.StringVar(value="粘贴网盘目录的完整路径，添加后自动扫描。")
         ttk.Label(outer, textvariable=self.status, wraplength=610).pack(anchor="w")
         window.protocol("WM_DELETE_WINDOW", self.close)
         window.after(60, self.process_events)
@@ -128,7 +143,7 @@ class App:
             return
         if ntpath.normcase(path) not in {ntpath.normcase(p) for p in self.folders.get(0, "end")}:
             self.folders.insert("end", path)
-            self.clear_files()
+            self.refresh()
         self.entry.delete(0, "end")
 
     def browse(self):
@@ -139,12 +154,18 @@ class App:
     def remove_folder(self):
         for index in reversed(self.folders.curselection()):
             self.folders.delete(index)
-        self.clear_files()
+        self.refresh()
+
+    def refresh(self):
+        if self.folders.size():
+            self.scan()
+        else:
+            self.clear_files()
 
     def clear_files(self):
         self.files.delete(*self.files.get_children())
         self.paths.clear()
-        self.status.set("点击扫描以更新文档清单。")
+        self.status.set("添加一个文件夹开始扫描。")
 
     def work(self, action, cancellable=False):
         self.busy = True
@@ -183,9 +204,10 @@ class App:
         printer = None
         if not dry:
             try:
+                require_acrobat_print_handler()
                 printer = default_printer()
             except OSError as exc:
-                messagebox.showerror("默认打印机", str(exc), parent=self.window)
+                messagebox.showerror("打印设置", str(exc), parent=self.window)
                 return
             if not messagebox.askokcancel("确认打印", f"向 {printer} 发出 {len(batch)} 个打印请求？", parent=self.window):
                 return
@@ -197,8 +219,8 @@ class App:
                     break
                 try:
                     with open(path, "rb") as document:
-                        if not document.read(1):
-                            raise OSError("文件为空")
+                        if b"%PDF-" not in document.read(1024):
+                            raise OSError("未找到 PDF 文件头")
                     if not dry:
                         if default_printer() != printer:
                             raise OSError("默认打印机发生变化，请重新确认。")
@@ -230,7 +252,7 @@ class App:
                     item = self.files.insert("", "end", values=(ntpath.basename(path), ntpath.dirname(path), "待处理"))
                     self.paths[item] = path
                 self.files.selection_set(self.files.get_children())
-                self.status.set(f"找到 {len(paths)} 份 Word 文档。目录错误 {len(errors)} 处。")
+                self.status.set(f"找到 {len(paths)} 份 PDF 文件。目录错误 {len(errors)} 处。")
                 if errors:
                     details = "\n".join(str(error) for error in errors[:5])
                     messagebox.showwarning("部分目录无法读取", details, parent=self.window)

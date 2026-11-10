@@ -1,12 +1,11 @@
-# Folder Word Printer
+# Folder PDF Printer
 
-Windows 上的单文件 Python 工具，用于扫描多个目录中的 .doc 和 .docx，并调用 Windows 的 Word 打印操作。需要公司已批准的 Python（带 Tkinter）、Microsoft Word 和默认打印机。脚本仅使用 Python 标准库。
+Windows 单文件 Python 工具。添加多个目录后自动递归查找 PDF，可确认清单后批量发出打印请求。需要公司已批准的 Python（带 Tkinter）、Adobe Acrobat Reader DC 和可用的 Windows 默认打印机。
 
-1. 下载 Release 里的 word_batch_print.py。
-2. 在脚本所在目录运行 py word_batch_print.py。
-3. 在资源管理器中打开网盘目标目录，按 Ctrl+L，再按 Ctrl+C。将复制的路径粘贴到脚本窗口，点「添加路径」。可添加多个目录，支持映射盘和 UNC 共享路径。
-4. 扫描后默认选中全部结果。可在列表中用 Ctrl 或 Shift 调整选择，先点「检查选中文件」验证可读性，再打印。
+1. 下载 Release 里的 pdf_batch_print.py，在脚本所在目录运行 py pdf_batch_print.py。
+2. 在资源管理器打开目标目录，按 Ctrl+L、Ctrl+C 复制路径，粘贴到工具里并点击「添加路径」。支持映射盘和 UNC 路径。浏览器链接需通过公司批准的同步或映射功能在资源管理器中打开。
+3. 添加、移除目录或改变子目录选项时会自动扫描。相同路径只列一次。文件变化后可点「重新扫描」。
+4. 列表默认全选，按 Ctrl 或 Shift 可调整选择。「检查选中文件」检查能否读取文件及识别 PDF 文件头。
+5. 将 Adobe Acrobat Reader 设为 Windows 默认 PDF 应用，确认默认实体打印机，点击「打印选中文件」并确认。
 
-可添加本机当前用户能访问的目录。浏览器中的网盘链接需要通过公司已批准的同步或映射功能，在资源管理器中以文件夹形式打开。扫描失败会显示系统错误。
-
-正式打印沿用 Windows 默认打印机及其首选项。列表显示的是已发出的打印请求，队列与出纸状态请在 Windows 中查看。停止按钮只停止后续请求。
+打印使用 Windows 为 PDF 注册的 Adobe 打印操作。列表记录请求是否发出，实际进度在 Windows 打印队列查看。停止仅影响后续请求。扫描不会发起打印，也不会持续监控目录。

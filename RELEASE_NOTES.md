@@ -1,5 +1,3 @@
-v3.0.0 提供单个 Python 源文件。新增网盘路径输入，可直接粘贴映射盘或 UNC 路径，也保留浏览按钮。
+v4.0.0 为单文件 Python PDF 批量打印版。支持直接输入多个映射盘或 UNC 文件夹，自动扫描子目录，去重后由用户确认打印。打印交给本机 Acrobat Reader DC。
 
-下载 word_batch_print.py，使用公司已批准的 Python 运行 py word_batch_print.py。脚本只使用标准库，调用本机 Word 的打印操作。
-
-路径识别、扫描、选择和演练已验证。公司网盘访问与出纸需在公司电脑上确认。
+下载 pdf_batch_print.py，用已批准的 Python 运行 py pdf_batch_print.py。将 Acrobat Reader 设为默认 PDF 应用，并确认 Windows 默认实体打印机。
