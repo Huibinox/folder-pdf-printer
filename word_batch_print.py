@@ -1,0 +1,263 @@
+# SPDX-License-Identifier: MIT
+"""Scan Word documents and invoke the Windows Print action."""
+import ctypes
+from ctypes import wintypes
+import ntpath
+import os
+import queue
+import re
+import threading
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+
+def normalize_folder(value):
+    value = value.strip().strip('"')
+    if not value or "://" in value or not ntpath.isabs(value):
+        raise ValueError("请输入资源管理器中的完整目录路径，例如 Z:\\部门 或 \\\\服务器\\共享。")
+    drive, _ = ntpath.splitdrive(value)
+    if not drive:
+        raise ValueError("请输入包含盘符或服务器共享名的完整路径。")
+    return ntpath.normpath(value)
+
+
+def scan_folders(folders, recursive):
+    files = {}
+    errors = []
+    for folder in folders:
+        for root, dirs, names in os.walk(folder, onerror=errors.append):
+            if not recursive:
+                dirs.clear()
+            else:
+                dirs[:] = [
+                    d for d in dirs
+                    if not getattr(os.path, "isjunction", os.path.islink)(os.path.join(root, d))
+                ]
+            for name in names:
+                if not name.startswith("~$") and ntpath.splitext(name)[1].lower() in {".doc", ".docx"}:
+                    path = os.path.join(root, name)
+                    files.setdefault(ntpath.normcase(path), path)
+    def sort_key(path):
+        return [int(part) if part.isascii() and part.isdigit() else part.casefold()
+                for part in re.split(r"([0-9]+)", path)]
+    return sorted(files.values(), key=sort_key), errors
+
+
+def default_printer():
+    get_name = ctypes.WinDLL("winspool.drv", use_last_error=True).GetDefaultPrinterW
+    get_name.argtypes = (wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+    get_name.restype = wintypes.BOOL
+    length = wintypes.DWORD()
+    get_name(None, ctypes.byref(length))
+    if not length.value:
+        raise OSError("请先在 Windows 设置中指定默认打印机。")
+    name = ctypes.create_unicode_buffer(length.value)
+    if not get_name(name, ctypes.byref(length)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if any(label in name.value.casefold() for label in ("print to pdf", "adobe pdf", "xps", "onenote", "fax")):
+        raise OSError(f"当前默认打印机为 {name.value}，请先选择实际打印机。")
+    return name.value
+
+
+class App:
+    def __init__(self, window):
+        self.window = window
+        self.events = queue.Queue()
+        self.stop_requested = threading.Event()
+        self.paths = {}
+        self.busy = False
+        self.controls = []
+        window.title("Word 批量打印 · Python 版")
+        window.geometry("880x580")
+        window.minsize(640, 440)
+        outer = ttk.Frame(window, padding=14)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="文件夹路径（支持映射盘和 UNC 共享路径）").pack(anchor="w")
+        row = ttk.Frame(outer)
+        row.pack(fill="x", pady=5)
+        self.entry = ttk.Entry(row)
+        self.entry.pack(side="left", fill="x", expand=True)
+        self.entry.bind("<Return>", lambda _: self.add_folder())
+        self.button(row, "添加路径", self.add_folder)
+        self.button(row, "浏览", self.browse)
+        self.button(row, "移除", self.remove_folder)
+        self.folders = tk.Listbox(outer, height=4)
+        self.folders.pack(fill="x")
+        row = ttk.Frame(outer)
+        row.pack(fill="x", pady=6)
+        self.recursive = tk.BooleanVar(value=True)
+        toggle = ttk.Checkbutton(row, text="包含子文件夹", variable=self.recursive, command=self.clear_files)
+        toggle.pack(side="left")
+        self.controls.extend([self.entry, toggle])
+        self.button(row, "扫描 Word", self.scan)
+        self.button(row, "全选", lambda: self.files.selection_set(self.files.get_children()))
+        self.button(row, "清除选中", lambda: self.files.selection_remove(self.files.selection()))
+        self.files = ttk.Treeview(outer, columns=("file", "folder", "status"), show="headings")
+        for column, title, width in (("file", "Word 文档", 210), ("folder", "所在目录", 400), ("status", "状态", 155)):
+            self.files.heading(column, text=title)
+            self.files.column(column, width=width, minwidth=80)
+        body = ttk.Frame(outer)
+        body.pack(fill="both", expand=True)
+        self.files.pack(in_=body, side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.files.yview)
+        scroll.pack(side="right", fill="y")
+        self.files.configure(yscrollcommand=scroll.set)
+        row = ttk.Frame(outer)
+        row.pack(fill="x", pady=6)
+        self.button(row, "检查选中文件", lambda: self.run_batch(dry=True))
+        self.button(row, "打印选中文件", lambda: self.run_batch(dry=False))
+        self.stop_button = ttk.Button(row, text="停止后续任务", command=self.stop_requested.set, state="disabled")
+        self.stop_button.pack(side="left", padx=4)
+        self.status = tk.StringVar(value="粘贴网盘目录的完整路径，添加后点击扫描。")
+        ttk.Label(outer, textvariable=self.status, wraplength=610).pack(anchor="w")
+        window.protocol("WM_DELETE_WINDOW", self.close)
+        window.after(60, self.process_events)
+
+    def button(self, parent, title, action):
+        button = ttk.Button(parent, text=title, command=action)
+        button.pack(side="left", padx=4)
+        self.controls.append(button)
+
+    def add_folder(self, value=None):
+        if self.busy:
+            return
+        try:
+            path = normalize_folder(self.entry.get() if value is None else value)
+        except ValueError as exc:
+            messagebox.showwarning("路径无效", str(exc), parent=self.window)
+            return
+        if ntpath.normcase(path) not in {ntpath.normcase(p) for p in self.folders.get(0, "end")}:
+            self.folders.insert("end", path)
+            self.clear_files()
+        self.entry.delete(0, "end")
+
+    def browse(self):
+        path = filedialog.askdirectory(parent=self.window)
+        if path:
+            self.add_folder(path)
+
+    def remove_folder(self):
+        for index in reversed(self.folders.curselection()):
+            self.folders.delete(index)
+        self.clear_files()
+
+    def clear_files(self):
+        self.files.delete(*self.files.get_children())
+        self.paths.clear()
+        self.status.set("点击扫描以更新文档清单。")
+
+    def work(self, action, cancellable=False):
+        self.busy = True
+        self.stop_requested.clear()
+        for control in self.controls:
+            control.configure(state="disabled")
+        if cancellable:
+            self.stop_button.configure(state="normal")
+
+        def worker():
+            try:
+                action()
+            except Exception as exc:
+                self.events.put(("error", str(exc)))
+            finally:
+                self.events.put(("done", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def scan(self):
+        folders = self.folders.get(0, "end")
+        if not folders:
+            messagebox.showinfo("扫描", "请先添加文件夹路径。", parent=self.window)
+            return
+        self.clear_files()
+        self.status.set("正在读取目录…")
+        recursive = self.recursive.get()
+        self.work(lambda: self.events.put(("scanned", scan_folders(folders, recursive))))
+
+    def run_batch(self, dry):
+        selected = set(self.files.selection())
+        batch = [(item, path) for item, path in self.paths.items() if item in selected]
+        if not batch:
+            messagebox.showinfo("选择文件", "请在列表中选中要处理的文档。", parent=self.window)
+            return
+        printer = None
+        if not dry:
+            try:
+                printer = default_printer()
+            except OSError as exc:
+                messagebox.showerror("默认打印机", str(exc), parent=self.window)
+                return
+            if not messagebox.askokcancel("确认打印", f"向 {printer} 发出 {len(batch)} 个打印请求？", parent=self.window):
+                return
+
+        def process():
+            ok = failed = 0
+            for item, path in batch:
+                if self.stop_requested.is_set():
+                    break
+                try:
+                    with open(path, "rb") as document:
+                        if not document.read(1):
+                            raise OSError("文件为空")
+                    if not dry:
+                        if default_printer() != printer:
+                            raise OSError("默认打印机发生变化，请重新确认。")
+                        if self.stop_requested.is_set():
+                            break
+                        os.startfile(path, "print")
+                    ok += 1
+                    self.events.put(("row", (item, "可读取" if dry else "已发出请求")))
+                except OSError as exc:
+                    failed += 1
+                    self.events.put(("row", (item, f"失败 · {exc}")))
+                    if not dry:
+                        self.events.put(("error", f"{path}\n\n{exc}"))
+                        break
+            self.events.put(("summary", f"成功 {ok}，失败 {failed}，未处理 {len(batch) - ok - failed}。"))
+
+        self.status.set("正在检查…" if dry else "正在发出打印请求…")
+        self.work(process, cancellable=True)
+
+    def process_events(self):
+        while True:
+            try:
+                event, data = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if event == "scanned":
+                paths, errors = data
+                for path in paths:
+                    item = self.files.insert("", "end", values=(ntpath.basename(path), ntpath.dirname(path), "待处理"))
+                    self.paths[item] = path
+                self.files.selection_set(self.files.get_children())
+                self.status.set(f"找到 {len(paths)} 份 Word 文档。目录错误 {len(errors)} 处。")
+                if errors:
+                    details = "\n".join(str(error) for error in errors[:5])
+                    messagebox.showwarning("部分目录无法读取", details, parent=self.window)
+            elif event == "row":
+                item, status = data
+                self.files.set(item, "status", status)
+                self.status.set(status)
+            elif event == "summary":
+                self.status.set(data)
+            elif event == "error":
+                messagebox.showerror("处理失败", data, parent=self.window)
+            elif event == "done":
+                self.busy = False
+                for control in self.controls:
+                    control.configure(state="normal")
+                self.stop_button.configure(state="disabled")
+        self.window.after(60, self.process_events)
+
+    def close(self):
+        if not self.busy:
+            self.window.destroy()
+        else:
+            self.stop_requested.set()
+            self.status.set("请等当前操作结束后关闭。")
+
+
+if __name__ == "__main__":
+    window = tk.Tk()
+    app = App(window)
+    window.mainloop()

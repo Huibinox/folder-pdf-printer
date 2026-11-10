@@ -1,5 +1,5 @@
-Word 轻量版 v2.0.0。只扫描 .doc 和 .docx，打印交给 Windows 已注册的 Word 打印操作。移除了 PDF 打印功能及附带引擎。
+v3.0.0 提供单个 Python 源文件。新增网盘路径输入，可直接粘贴映射盘或 UNC 路径，也保留浏览按钮。
 
-下载 FolderWordPrinter-v2.0.0-win-x64.zip，解压后双击 FolderWordPrinter.exe。公司电脑需要已有 Microsoft Word 和可用的 Windows 默认打印机。
+下载 word_batch_print.py，使用公司已批准的 Python 运行 py word_batch_print.py。脚本只使用标准库，调用本机 Word 的打印操作。
 
-演练模式默认开启。正式打印请先用两份文档试打，并在 Windows 打印队列检查结果。
+路径识别、扫描、选择和演练已验证。公司网盘访问与出纸需在公司电脑上确认。

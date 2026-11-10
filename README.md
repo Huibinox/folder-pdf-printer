@@ -1,16 +1,12 @@
 # Folder Word Printer
 
-轻量 Windows 中文工具。递归扫描多个文件夹中的 .doc 和 .docx，勾选后调用 Windows 注册的 Word 打印操作。
+Windows 上的单文件 Python 工具，用于扫描多个目录中的 .doc 和 .docx，并调用 Windows 的 Word 打印操作。需要公司已批准的 Python（带 Tkinter）、Microsoft Word 和默认打印机。脚本仅使用 Python 标准库。
 
-1. 解压 Release 的 ZIP，双击 FolderWordPrinter.exe。
-2. 添加或拖入多个文件夹，点击「扫描 Word」。
-3. 勾选要打印的文件。默认演练只检查文件可读且非空，不能验证 Word 能否正常打开文件。
-4. 在 Windows 设置中确认默认打印机。关闭演练模式，重新勾选文件，再点击「开始」并确认。
+1. 下载 Release 里的 word_batch_print.py。
+2. 在脚本所在目录运行 py word_batch_print.py。
+3. 在资源管理器中打开网盘目标目录，按 Ctrl+L，再按 Ctrl+C。将复制的路径粘贴到脚本窗口，点「添加路径」。可添加多个目录，支持映射盘和 UNC 共享路径。
+4. 扫描后默认选中全部结果。可在列表中用 Ctrl 或 Shift 调整选择，先点「检查选中文件」验证可读性，再打印。
 
-需要 Windows 10 / 11 x64、自带的 .NET Framework、已安装的 Microsoft Word 和可用的打印机。可以先在资源管理器中对 Word 文件试用「显示更多选项 → 打印」，确认当前关联应用支持这个操作。
+可添加本机当前用户能访问的目录。浏览器中的网盘链接需要通过公司已批准的同步或映射功能，在资源管理器中以文件夹形式打开。扫描失败会显示系统错误。
 
-程序会逐个发出打印请求，使用 Windows 默认打印机及其打印首选项。请求成功只表示 Windows 接收了该操作，实际队列、出纸和打印顺序由 Word 和打印机处理。若 Word 弹出受保护视图、密码或其他提示，请在 Word 中处理。
-
-停止按钮影响后续文件。已发出的请求请在打印队列查看。日志位于 %LOCALAPPDATA%\FolderWordPrinter。
-
-从仓库根目录运行 build.ps1 可编译并运行核心扫描测试。项目使用 MIT 许可。
+正式打印沿用 Windows 默认打印机及其首选项。列表显示的是已发出的打印请求，队列与出纸状态请在 Windows 中查看。停止按钮只停止后续请求。
