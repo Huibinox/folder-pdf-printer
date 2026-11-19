@@ -1,13 +1,20 @@
 # Folder PDF Printer
 
-Windows 单文件 Python 工具，可扫描多个目录中的 PDF。需要已批准的 Python（带 Tkinter）和 Adobe Acrobat Reader DC。
+A single-file Python tool for Windows that scans multiple folders for PDFs and sends selected files to Adobe Acrobat Reader DC for batch printing. Requires an approved Python installation with Tkinter and Adobe Acrobat Reader DC.
 
-1. 下载 Release 的 pdf_batch_print.py，在脚本目录运行 py pdf_batch_print.py。
-2. 从资源管理器复制文件夹路径并添加，支持映射盘和 UNC 路径。添加后自动扫描，默认包括子目录。
-3. 先手动启动 Acrobat Reader。选中几份文件，点击「在 Acrobat 打开」，可通过 Adobe 的按路径打开接口验证多文件交接。
-   如果提示无法连接 Reader，单选一份文件，点「复制 PDF 路径」，到 Reader 按 Ctrl+O，将完整路径粘贴到文件名框。
-4. 确认 Acrobat 使用 Windows 默认实体打印机，再选少量文件试用「打印选中文件」。
+## Usage
 
-脚本直接调用 Adobe Reader 的文档接口。每次打印后在 Windows 队列中查找本用户的新任务，匹配文件名后才处理下一份。队列名称不同、权限不足或任务离开队列过快，都可能导致无法确认。此时脚本停止，需先检查队列和出纸结果再决定是否重试。
+1. Download `pdf_batch_print.py` from [Releases](https://github.com/Huibinox/folder-pdf-printer/releases). In its folder, run `py pdf_batch_print.py`.
+2. Copy folder paths from File Explorer and add them. Mapped drives and UNC paths are supported. Scanning starts automatically after adding a folder and includes subfolders by default.
+3. Start Acrobat Reader manually. Select a few files and click Open in Acrobat (`在 Acrobat 打开`) to check that Adobe's path-based interface accepts multiple files. If Reader cannot be connected, select one file and click Copy PDF Path (`复制 PDF 路径`), then press Ctrl+O in Reader and paste the full path into the filename field.
+4. Confirm that Acrobat uses the Windows default physical printer. Try Print Selected Files (`打印选中文件`) with a small selection first.
 
-当前版本是试用版。本机验证了 Acrobat 接受两份打开请求、实际读取虚拟打印队列，以及模拟三份打印任务逐份确认。尚未验证公司环境中的实际出纸。
+The software interface remains in Chinese; the labels above identify its existing buttons.
+
+## Print confirmation
+
+The script calls Adobe Reader's document interface directly. After each print request, it looks for a new job belonging to the current user in the Windows print queue and matches the filename before continuing. Different queue names, insufficient permissions, or jobs leaving the queue too quickly can prevent confirmation. In that case, the script stops. Check the queue and physical output before deciding whether to retry.
+
+## Verification limits
+
+This is a trial version. Local checks confirmed that Acrobat accepted two open requests, that a virtual print queue could be read, and that three simulated print jobs were confirmed sequentially. Physical printing in the company environment has not been verified.
