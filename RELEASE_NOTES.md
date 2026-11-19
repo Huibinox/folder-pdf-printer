@@ -1,3 +1,5 @@
-v4.0.0 为单文件 Python PDF 批量打印版。支持直接输入多个映射盘或 UNC 文件夹，自动扫描子目录，去重后由用户确认打印。打印交给本机 Acrobat Reader DC。
+# v4.0.0
 
-下载 pdf_batch_print.py，用已批准的 Python 运行 py pdf_batch_print.py。将 Acrobat Reader 设为默认 PDF 应用，并确认 Windows 默认实体打印机。
+A single-file Python tool for batch PDF printing. Enter multiple mapped-drive or UNC folder paths, scan subfolders automatically, and review the deduplicated file list before printing. Printing is handled by the local Acrobat Reader DC installation.
+
+Download `pdf_batch_print.py` and run `py pdf_batch_print.py` using an approved Python installation. Set Acrobat Reader as the default PDF application and confirm the Windows default physical printer.
